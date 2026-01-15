@@ -1,112 +1,96 @@
-;;; walnut.el --- Manipulate textobjects with tree-sitter -*- lexical-binding: t -*-
-
-;; Copyright (C) 2021-2026 Free Software Foundation, Inc.
-;; Author: Adran Carnavale <adran.carnavale@gmail.com>
-;; Version: 0.1
+;;; walnut.el --- Advanced Tree-sitter Selection Engine -*- lexical-binding: t -*-
 
 (require 'treesit)
 (require 'transient)
+(require 'cl-lib)
 
-;;; Functions
+(defvar walnut-queries-file (expand-file-name "queries.scm" (file-name-directory (or load-file-name buffer-file-name)))
+  "Path to the master queries.scm file.")
 
-;;;###autoload
-(defun walnut-select-inside-quotes ()
-  "Select the content inside a Python string using the string_content node."
-  (interactive)
-  (let* ((query "((string (string_content) @content))")
-         (node (treesit-node-at (point)))
-         (string-node (treesit-parent-until
-                       node
-                       (lambda (n) (member (treesit-node-type n) '("string"))))))
-    (if (not string-node)
-        (user-error "Not inside a string")
-      (let* ((captures (treesit-query-capture string-node query))
-             (content-node (cdr (assoc 'content captures))))
-        (if content-node
-            (let ((beg (treesit-node-start content-node))
-                  (end (treesit-node-end content-node)))
-              (goto-char beg)
-              (push-mark end t t))
-          ;; If there's no string_content node, the string is likely empty ("")
-          (message "String is empty"))))))
+(defvar walnut--mode-to-lang-map
+  '((python-ts-mode . python)
+    (python-mode    . python))
+  "Map major modes to tree-sitter language symbols.")
 
-;;;###autoload
-(defun walnut-select-around-quotes ()
-  "Select the entire Python string, including the quotes."
-  (interactive)
-  (let* ((node (treesit-node-at (point)))
-         (string-node (treesit-parent-until
-                       node
-                       (lambda (n) (member (treesit-node-type n) '("string"))))))
-    (if (not string-node)
-        (user-error "Not inside a string")
-      (goto-char (treesit-node-start string-node))
-      (push-mark (treesit-node-end string-node) t t))))
+;; --- UTILITIES ---
 
-;;;###autoload
-(defun walnut-select-inside-brackets ()
-  "Select inside brackets. Falls back to point-between-brackets if empty."
-  (interactive)
-  (let* ((query "([ (list \"[\" @open \"]\" @close)
-                    (tuple \"(\" @open \")\" @close)
-                    (dictionary \"{\" @open \"}\" @close)
-                    (subscript \"[\" @open \"]\" @close)
-                    (list \"[\" . (_) @start (_) @end . \"]\")
-                    (tuple \"(\" . (_) @start (_) @end . \")\")
-                    (dictionary \"{\" . (_) @start (_) @end . \"}\")
-                    (subscript \"[\" . (_) @start (_) @end . \"]\") ])")
-         (node (treesit-node-at (point)))
-         (container (treesit-parent-until
-                     node
-                     (lambda (n) (member (treesit-node-type n)
-                                         '("list" "tuple" "dictionary" "subscript"))))))
-    (if (not container)
-        (user-error "Not inside brackets")
-      (let* ((captures (treesit-query-capture container query))
-             (start (cdr (assoc 'start captures)))
-             (end (cdr (assoc 'end captures)))
-             (open (cdr (assoc 'open captures))))
-        (cond ((and start end)
-               (goto-char (treesit-node-start start))
-               (push-mark (treesit-node-end end) t t))
-              (open
-               (goto-char (treesit-node-end open))
-               (message "Empty collection")))))))
+(defun walnut--get-all-queries-for-lang (lang type)
+  "Extract all query patterns for LANG and TYPE from queries.scm."
+  (with-temp-buffer
+    (insert-file-contents walnut-queries-file)
+    (goto-char (point-min))
+    (let ((header (format "[%s :%s]" (symbol-name lang) (substring (symbol-name type) 1)))
+          (start nil)
+          (patterns '()))
+      (when (search-forward header nil t)
+        (forward-line 1)
+        (setq start (point))
+        ;; Read until the next header or end of file
+        (while (and (not (eobp)) (not (looking-at "\n;; \\[")))
+          (forward-sexp 1)
+          (push (buffer-substring-no-properties start (point)) patterns)
+          (skip-chars-forward " \t\n")
+          (setq start (point))))
+      (mapconcat #'identity (nreverse patterns) "\n"))))
 
-;;;###autoload
-(defun walnut-select-around-brackets ()
-  "Select the entire Python collection, including the brackets."
-  (interactive)
-  (let* ((node (treesit-node-at (point)))
-         (container (treesit-parent-until
-                     node
-                     (lambda (n) (member (treesit-node-type n)
-                                         '("list" "tuple" "dictionary" "subscript"))))))
-    (if (not container)
-        (user-error "Not inside brackets")
-      (goto-char (treesit-node-start container))
-      (push-mark (treesit-node-end container) t t))))
+;; --- THE ENGINE ---
 
-;;; UI and Dispatcher
+(defun walnut--select-text-object (type scope)
+  "Universal selector. TYPE is :quotes, :brackets, etc. SCOPE is :inside or :around."
+  (let* ((lang (or (alist-get major-mode walnut--mode-to-lang-map) (user-error "Mode not mapped")))
+         (query-str (walnut--get-all-queries-for-lang lang type))
+         (curr-node (treesit-node-at (point)))
+         (found-node nil)
+         (relevant-captures nil)
+         (target-capture-name (if (eq scope :inside) "content" "around")))
 
-;;;###autoload
+    (if (string-empty-p query-str)
+        (message "Walnut: No queries found for %s" type)
+
+      ;; Search up the tree
+      (while (and curr-node (not found-node))
+        (let* ((captures (ignore-errors (treesit-query-capture curr-node lang query-str)))
+               ;; Filter for the specific capture name (content vs around)
+               (matches (cl-remove-if-not
+                         (lambda (c) (string= (symbol-name (car c)) target-capture-name))
+                         captures)))
+          (if matches
+              (setq found-node curr-node
+                    relevant-captures matches)
+            (setq curr-node (treesit-node-parent curr-node)))))
+
+      (if found-node
+          (let* ((beg (treesit-node-start (cdr (car relevant-captures))))
+                 (end (treesit-node-end (cdr (car (last relevant-captures))))))
+            (deactivate-mark)
+            (goto-char beg)
+            (push-mark end t t)
+            (activate-mark)
+            (message "Walnut: Selected %s %s (%s)" type scope (treesit-node-type found-node)))
+        (message "Walnut: No matching %s found." type)))))
+
+;; --- COMMANDS ---
+
+(defun walnut-select-inside-quotes () (interactive) (walnut--select-text-object :quotes :inside))
+(defun walnut-select-around-quotes () (interactive) (walnut--select-text-object :quotes :around))
+(defun walnut-select-inside-brackets () (interactive) (walnut--select-text-object :brackets :inside))
+(defun walnut-select-around-brackets () (interactive) (walnut--select-text-object :brackets :around))
+(defun walnut-select-inside-block () (interactive) (walnut--select-text-object :blocks :inside))
+
+;; --- MENU ---
+
 (transient-define-prefix walnut-dispatch ()
-  "Dispatch a walnut command."
-  ["Textobjects"
-   ("q" "Inside Quotes" walnut-select-inside-quotes)
-   ("Q" "Around Quotes" walnut-select-around-quotes)
-   ("b" "Inside Brackets" walnut-select-inside-brackets)
-   ("B" "Around Brackets" walnut-select-around-brackets)])
+  "Walnut: Tree-sitter Text Objects"
+  [["Quotes"
+    ("q" "Inside" walnut-select-inside-quotes)
+    ("Q" "Around" walnut-select-around-quotes)]
+   ["Brackets/Collections"
+    ("b" "Inside" walnut-select-inside-brackets)
+    ("B" "Around" walnut-select-around-brackets)]
+   ["Blocks (Fn/Class)"
+    ("k" "Inside" walnut-select-inside-block)]]
+  [("q" "Quit" transient-quit-one)])
 
-;;; Initialization
-
-(defvar walnut-prefix-key "C-c w"
-  "Prefix key for Walnut commands.")
-
-;;;###autoload
-(progn
-  (keymap-global-set walnut-prefix-key #'walnut-dispatch))
-
+(keymap-global-set "C-c s" #'walnut-dispatch)
 (provide 'walnut)
-
 ;;; walnut.el ends here
